@@ -1,20 +1,13 @@
-extern crate encoding;
-extern crate memchr;
-extern crate simple_error;
-extern crate time;
-
 mod binding;
+pub use binding::*;
 
 use encoding::{ DecoderTrap, Encoding };
 use encoding::all::GB18030;
 use simple_error::SimpleError;
 use std::borrow::Cow;
-use std::error::Error;
 use std::fmt;
 use std::os::raw::c_int;
 use time::{ Timespec, Tm };
-
-pub use binding::*;
 
 /// 交易接口中的查询操作的限制为:
 ///   每秒钟最多只能进行一次查询操作。
@@ -53,7 +46,7 @@ pub fn ascii_cstr_to_str(s: &[u8]) -> Result<&str, SimpleError> {
     }
 }
 
-pub fn gb18030_cstr_to_str<'a>(v: &'a [u8]) -> Cow<'a, str> {
+pub fn gb18030_cstr_to_str(v: &[u8]) -> Cow<str> {
     let slice = v.split(|&c| c == 0u8).next().unwrap();
     if slice.is_ascii() {
         unsafe {
@@ -153,19 +146,15 @@ pub enum ApiError {
 }
 
 impl std::error::Error for ApiError {
-    fn description(&self) -> &str {
-        use ApiError::*;
-        match *self {
-            NetworkError => "network error",
-            QueueFull => "queue full",
-            Throttled => "throttled",
-        }
-    }
 }
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(self.description())
+        match *self {
+            ApiError::NetworkError => f.write_str("network error"),
+            ApiError::QueueFull => f.write_str("queue full"),
+            ApiError::Throttled => f.write_str("throttled"),
+        }
     }
 }
 
@@ -191,9 +180,6 @@ pub struct RspError {
 }
 
 impl std::error::Error for RspError {
-    fn description(&self) -> &str {
-        &self.msg
-    }
 }
 
 impl fmt::Display for RspError {
@@ -207,19 +193,23 @@ pub type RspResult = Result<(), RspError>;
 
 pub fn from_rsp_result_to_string(rsp_result: &RspResult) -> String {
     match rsp_result {
-        &Ok(()) => "Ok(())".to_string(),
-        &Err(ref err) => format!("Err(RspError{{ id: {}, msg: {} }})", err.id, err.msg),
+        Ok(()) => "Ok(())".to_string(),
+        Err(err) => format!("Err(RspError{{ id: {}, msg: {} }})", err.id, err.msg),
     }
 }
 
-pub fn from_rsp_info_to_rsp_result(rsp_info: *const CThostFtdcRspInfoField) -> RspResult {
+/// # Safety
+///
+/// `rsp_info` needs to be either a null pointer or a valid pointer of type `CThostFtdcRspInfoField`.
+pub unsafe fn from_rsp_info_to_rsp_result(rsp_info: *const CThostFtdcRspInfoField) -> RspResult {
+    #[allow(unused_unsafe)] // for future "unsafe blocks in unsafe fn" feature
     match unsafe { rsp_info.as_ref() } {
-        Some(info) => match *info {
-            CThostFtdcRspInfoField { ErrorID: 0, ErrorMsg: _ } => {
+        Some(info) => match info {
+            CThostFtdcRspInfoField { ErrorID: 0, .. } => {
                 Ok(())
             },
-            CThostFtdcRspInfoField { ErrorID: id, ErrorMsg: ref msg } => {
-                Err(RspError{ id: id, msg: gb18030_cstr_to_str(msg).into_owned() })
+            CThostFtdcRspInfoField { ErrorID: id, ErrorMsg: msg } => {
+                Err(RspError{ id: *id, msg: gb18030_cstr_to_str(msg).into_owned() })
             }
         },
         None => {
@@ -229,16 +219,18 @@ pub fn from_rsp_info_to_rsp_result(rsp_info: *const CThostFtdcRspInfoField) -> R
 }
 
 pub fn is_terminal_order_status(order_status: TThostFtdcOrderStatusType) -> bool {
-    return order_status == THOST_FTDC_OST_AllTraded ||
+    order_status == THOST_FTDC_OST_AllTraded ||
         order_status == THOST_FTDC_OST_PartTradedNotQueueing ||
         order_status == THOST_FTDC_OST_NoTradeNotQueueing ||
-        order_status == THOST_FTDC_OST_Canceled;
+        order_status == THOST_FTDC_OST_Canceled
 }
 
 pub fn is_valid_order_sys_id(order_sys_id: &TThostFtdcOrderSysIDType) -> bool {
-    return order_sys_id[0] != b'\0';
+    order_sys_id[0] != b'\0'
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)] // Will be removed
+#[deprecated(since = "0.9.0", note = "This will be removed in 0.10.0")]
 pub fn to_exchange_timestamp(trading_day: &TThostFtdcDateType,
                               update_time: &TThostFtdcTimeType,
                               update_millisec: &TThostFtdcMillisecType) -> Result<Timespec, SimpleError> {

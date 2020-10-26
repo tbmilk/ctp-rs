@@ -1,9 +1,4 @@
-#[cfg(feature = "channel")]
-extern crate crossbeam_channel;
-extern crate ctp_common;
-
 use std::ffi::{ CStr, CString };
-use std::mem::transmute;
 use std::os::raw::{ c_void, c_char, c_int };
 use std::sync::mpsc;
 
@@ -62,7 +57,7 @@ pub trait GenericMdApi {
     fn register_front(&mut self, front_socket_address: CString);
     fn register_name_server(&mut self, name_server: CString);
     fn register_fens_user_info(&mut self, fens_user_info: &CThostFtdcFensUserInfoField);
-    fn register_spi(&mut self, md_spi: Box<MdSpi>);
+    fn register_spi(&mut self, md_spi: Box<dyn MdSpi>);
     fn subscribe_market_data(&mut self, instrument_ids: &[CString]) -> ApiResult;
     fn unsubscribe_market_data(&mut self, instrument_ids: &[CString]) -> ApiResult;
     fn subscribe_for_quote_rsp(&mut self, instrument_ids: &[CString]) -> ApiResult;
@@ -119,7 +114,7 @@ impl GenericMdApi for MdApi {
         unsafe { CFtdcMdApiImplRegisterFensUserInfo(self.md_api_ptr, fens_user_info) };
     }
 
-    fn register_spi(&mut self, md_spi: Box<MdSpi>) {
+    fn register_spi(&mut self, md_spi: Box<dyn MdSpi>) {
         let last_registered_spi_ptr = self.registered_spi.take();
         let md_spi_ptr = Box::into_raw(md_spi);
         let spi_ptr = Box::into_raw(Box::new(new_spi(md_spi_ptr)));
@@ -128,7 +123,8 @@ impl GenericMdApi for MdApi {
         if let Some(last_registered_spi_ptr) = last_registered_spi_ptr {
             unsafe {
                 let last_registered_spi = Box::from_raw(last_registered_spi_ptr);
-                drop(last_registered_spi.md_spi_ptr);
+                let md_spi = Box::from_raw(last_registered_spi.md_spi_ptr);
+                drop(md_spi);
                 drop(last_registered_spi);
             }
         };
@@ -170,7 +166,8 @@ impl Drop for MdApi {
             unsafe {
                 CFtdcMdApiImplRegisterSpi(self.md_api_ptr, ::std::ptr::null_mut::<c_void>());
                 let last_registered_spi = Box::from_raw(last_registered_spi_ptr);
-                drop(last_registered_spi.md_spi_ptr);
+                let md_spi = Box::from_raw(last_registered_spi.md_spi_ptr);
+                drop(md_spi);
                 drop(last_registered_spi);
             }
         };
@@ -315,6 +312,7 @@ pub struct MdSpiOnRtnForQuoteRsp {
     pub for_quote_rsp: CThostFtdcForQuoteRspField,
 }
 
+#[allow(clippy::large_enum_variant)] // For consistency
 #[derive(Clone, Debug)]
 pub enum MdSpiOutput {
     FrontConnected(MdSpiOnFrontConnected),
@@ -338,7 +336,7 @@ pub struct SenderMdSpi<T: From<MdSpiOutput> + Send + 'static> {
 impl<T> SenderMdSpi<T> where T: From<MdSpiOutput> + Send + 'static {
     pub fn new(sender: mpsc::Sender<T>) -> Self {
         SenderMdSpi {
-            sender: sender,
+            sender,
         }
     }
 }
@@ -349,55 +347,55 @@ impl<T> MdSpi for SenderMdSpi<T> where T: From<MdSpiOutput> + Send + 'static {
     }
 
     fn on_front_disconnected(&mut self, reason: DisconnectionReason) {
-        self.sender.send(T::from(MdSpiOutput::FrontDisconnected(MdSpiOnFrontDisconnected{ reason: reason }))).expect("spi callback send front_disconnected failed");
+        self.sender.send(T::from(MdSpiOutput::FrontDisconnected(MdSpiOnFrontDisconnected{ reason }))).expect("spi callback send front_disconnected failed");
     }
 
     fn on_rsp_user_login(&mut self, rsp_user_login: Option<&CThostFtdcRspUserLoginField>, result: RspResult, request_id: i32, is_last: bool) {
-        self.sender.send(T::from(MdSpiOutput::RspUserLogin(MdSpiOnRspUserLogin{ user_login: rsp_user_login.cloned(), result: result, request_id: request_id, is_last: is_last }))).expect("spi callback send rsp_user_login failed");
+        self.sender.send(T::from(MdSpiOutput::RspUserLogin(MdSpiOnRspUserLogin{ user_login: rsp_user_login.cloned(), result, request_id, is_last }))).expect("spi callback send rsp_user_login failed");
     }
 
     fn on_rsp_user_logout(&mut self, rsp_user_logout: Option<&CThostFtdcUserLogoutField>, result: RspResult, request_id: i32, is_last: bool) {
-        self.sender.send(T::from(MdSpiOutput::RspUserLogout(MdSpiOnRspUserLogout{ user_logout: rsp_user_logout.cloned(), result: result, request_id: request_id, is_last: is_last }))).expect("spi callback send rsp_user_logout failed");
+        self.sender.send(T::from(MdSpiOutput::RspUserLogout(MdSpiOnRspUserLogout{ user_logout: rsp_user_logout.cloned(), result, request_id, is_last }))).expect("spi callback send rsp_user_logout failed");
     }
 
     fn on_rsp_error(&mut self, result: RspResult, request_id: i32, is_last: bool) {
-        self.sender.send(T::from(MdSpiOutput::RspError(MdSpiOnRspError{ result: result, request_id: request_id, is_last: is_last }))).expect("spi callback send rsp_error failed");
+        self.sender.send(T::from(MdSpiOutput::RspError(MdSpiOnRspError{ result, request_id, is_last }))).expect("spi callback send rsp_error failed");
     }
 
     fn on_rsp_sub_market_data(&mut self, specific_instrument: Option<&CThostFtdcSpecificInstrumentField>, result: RspResult, request_id: i32, is_last: bool) {
-        self.sender.send(T::from(MdSpiOutput::SubMarketData(MdSpiOnRspSubMarketData{ specific_instrument: specific_instrument.cloned(), result: result, request_id: request_id, is_last: is_last }))).expect("spi callback send rsp_sub_market_data failed");
+        self.sender.send(T::from(MdSpiOutput::SubMarketData(MdSpiOnRspSubMarketData{ specific_instrument: specific_instrument.cloned(), result, request_id, is_last }))).expect("spi callback send rsp_sub_market_data failed");
     }
 
     fn on_rsp_un_sub_market_data(&mut self, specific_instrument: Option<&CThostFtdcSpecificInstrumentField>, result: RspResult, request_id: i32, is_last: bool) {
-        self.sender.send(T::from(MdSpiOutput::UnSubMarketData(MdSpiOnRspUnSubMarketData{ specific_instrument: specific_instrument.cloned(), result: result, request_id: request_id, is_last: is_last }))).expect("spi callback send rsp_sub_market_data failed");
+        self.sender.send(T::from(MdSpiOutput::UnSubMarketData(MdSpiOnRspUnSubMarketData{ specific_instrument: specific_instrument.cloned(), result, request_id, is_last }))).expect("spi callback send rsp_sub_market_data failed");
     }
 
     fn on_rsp_sub_for_quote_rsp(&mut self, specific_instrument: Option<&CThostFtdcSpecificInstrumentField>, result: RspResult, request_id: TThostFtdcRequestIDType, is_last: bool) {
-        self.sender.send(T::from(MdSpiOutput::SubForQuoteRsp(MdSpiOnRspSubForQuoteRsp{ specific_instrument: specific_instrument.cloned(), result: result, request_id: request_id, is_last: is_last }))).expect("spi callback send rsp_sub_sub_for_quote_rsp failed");
+        self.sender.send(T::from(MdSpiOutput::SubForQuoteRsp(MdSpiOnRspSubForQuoteRsp{ specific_instrument: specific_instrument.cloned(), result, request_id, is_last }))).expect("spi callback send rsp_sub_sub_for_quote_rsp failed");
     }
 
     fn on_rsp_un_sub_for_quote_rsp(&mut self, specific_instrument: Option<&CThostFtdcSpecificInstrumentField>, result: RspResult, request_id: TThostFtdcRequestIDType, is_last: bool) {
-        self.sender.send(T::from(MdSpiOutput::UnSubForQuoteRsp(MdSpiOnRspUnSubForQuoteRsp{ specific_instrument: specific_instrument.cloned(), result: result, request_id: request_id, is_last: is_last }))).expect("spi callback send rsp_sub_sub_for_quote_rsp failed");
+        self.sender.send(T::from(MdSpiOutput::UnSubForQuoteRsp(MdSpiOnRspUnSubForQuoteRsp{ specific_instrument: specific_instrument.cloned(), result, request_id, is_last }))).expect("spi callback send rsp_sub_sub_for_quote_rsp failed");
     }
 
     fn on_rtn_depth_market_data(&mut self, depth_market_data: Option<&CThostFtdcDepthMarketDataField>) {
-        self.sender.send(T::from(MdSpiOutput::DepthMarketData(MdSpiOnRtnDepthMarketData{ depth_market_data: depth_market_data.expect("depth_market_data is none").clone() }))).expect("spi callback send depth_market_data failed");
+        self.sender.send(T::from(MdSpiOutput::DepthMarketData(MdSpiOnRtnDepthMarketData{ depth_market_data: *depth_market_data.expect("depth_market_data is none") }))).expect("spi callback send depth_market_data failed");
     }
 
     fn on_rtn_for_quote_rsp(&mut self, for_quote_rsp: Option<&CThostFtdcForQuoteRspField>) {
-        self.sender.send(T::from(MdSpiOutput::ForQuoteRsp(MdSpiOnRtnForQuoteRsp{ for_quote_rsp: for_quote_rsp.expect("for_quote_rsp is none").clone() }))).expect("spi callback send depth_market_data failed");
+        self.sender.send(T::from(MdSpiOutput::ForQuoteRsp(MdSpiOnRtnForQuoteRsp{ for_quote_rsp: *for_quote_rsp.expect("for_quote_rsp is none") }))).expect("spi callback send depth_market_data failed");
     }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_front_connected(spi: *mut CThostFtdcMdSpi) {
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_front_connected() };
+    unsafe { (*(*spi).md_spi_ptr).on_front_connected() };
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_front_disconnected(spi: *mut CThostFtdcMdSpi, nReason: c_int) {
     let reason = std::convert::From::from(nReason);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_front_disconnected(reason) };
+    unsafe { (*(*spi).md_spi_ptr).on_front_disconnected(reason) };
 }
 
 #[allow(non_snake_case, unused_variables)]
@@ -408,54 +406,68 @@ extern "C" fn spi_on_heart_beat_warning(spi: *mut CThostFtdcMdSpi, nTimeLapse: c
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rsp_user_login(spi: *mut CThostFtdcMdSpi, pRspUserLogin: *const CThostFtdcRspUserLoginField, pRspInfo: *const CThostFtdcRspInfoField, nRequestID: c_int, bIsLast: c_bool) {
-    let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rsp_user_login(pRspUserLogin.as_ref(), rsp_info, nRequestID, bIsLast != 0) };
+    unsafe {
+        let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
+        (*(*spi).md_spi_ptr).on_rsp_user_login(pRspUserLogin.as_ref(), rsp_info, nRequestID, bIsLast != 0);
+    }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rsp_user_logout(spi: *mut CThostFtdcMdSpi, pUserLogout: *const CThostFtdcUserLogoutField, pRspInfo: *const CThostFtdcRspInfoField, nRequestID: c_int, bIsLast: c_bool) {
-    let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rsp_user_logout(pUserLogout.as_ref(), rsp_info, nRequestID, bIsLast != 0) };
+    unsafe {
+        let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
+        (*(*spi).md_spi_ptr).on_rsp_user_logout(pUserLogout.as_ref(), rsp_info, nRequestID, bIsLast != 0);
+    }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rsp_error(spi: *mut CThostFtdcMdSpi, pRspInfo: *const CThostFtdcRspInfoField, nRequestID: c_int, bIsLast: c_bool) {
-    let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rsp_error(rsp_info, nRequestID, bIsLast != 0) };
+    unsafe {
+        let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
+        (*(*spi).md_spi_ptr).on_rsp_error(rsp_info, nRequestID, bIsLast != 0);
+    }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rsp_sub_market_data(spi: *mut CThostFtdcMdSpi, pSpecificInstrument: *const CThostFtdcSpecificInstrumentField, pRspInfo: *const CThostFtdcRspInfoField, nRequestID: c_int, bIsLast: c_bool) {
-    let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rsp_sub_market_data(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0) };
+    unsafe {
+        let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
+        (*(*spi).md_spi_ptr).on_rsp_sub_market_data(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0);
+    }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rsp_un_sub_market_data(spi: *mut CThostFtdcMdSpi, pSpecificInstrument: *const CThostFtdcSpecificInstrumentField, pRspInfo: *const CThostFtdcRspInfoField, nRequestID: c_int, bIsLast: c_bool) {
-    let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rsp_un_sub_market_data(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0) };
+    unsafe {
+        let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
+        (*(*spi).md_spi_ptr).on_rsp_un_sub_market_data(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0);
+    }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rsp_sub_for_quote_rsp(spi: *mut CThostFtdcMdSpi, pSpecificInstrument: *const CThostFtdcSpecificInstrumentField, pRspInfo: *const CThostFtdcRspInfoField, nRequestID: c_int, bIsLast: c_bool) {
-    let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rsp_sub_for_quote_rsp(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0) };
+    unsafe {
+        let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
+        (*(*spi).md_spi_ptr).on_rsp_sub_for_quote_rsp(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0);
+    }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rsp_un_sub_for_quote_rsp(spi: *mut CThostFtdcMdSpi, pSpecificInstrument: *const CThostFtdcSpecificInstrumentField, pRspInfo: *const CThostFtdcRspInfoField, nRequestID: c_int, bIsLast: c_bool) {
-    let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rsp_un_sub_for_quote_rsp(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0) };
+    unsafe {
+        let rsp_info = from_rsp_info_to_rsp_result(pRspInfo);
+        (*(*spi).md_spi_ptr).on_rsp_un_sub_for_quote_rsp(pSpecificInstrument.as_ref(), rsp_info, nRequestID, bIsLast != 0);
+    }
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rtn_depth_market_data(spi: *mut CThostFtdcMdSpi, pDepthMarketData: *const CThostFtdcDepthMarketDataField ) {
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rtn_depth_market_data(pDepthMarketData.as_ref()) };
+    unsafe { (*(*spi).md_spi_ptr).on_rtn_depth_market_data(pDepthMarketData.as_ref()) };
 }
 
 #[allow(non_snake_case)]
 extern "C" fn spi_on_rtn_for_quote_rsp(spi: *mut CThostFtdcMdSpi, pForQuoteRsp: *const CThostFtdcForQuoteRspField ) {
-    unsafe { transmute::<*mut MdSpi, &mut MdSpi>(transmute::<*mut CThostFtdcMdSpi, &mut CThostFtdcMdSpi>(spi).md_spi_ptr).on_rtn_for_quote_rsp(pForQuoteRsp.as_ref()) };
+    unsafe { (*(*spi).md_spi_ptr).on_rtn_for_quote_rsp(pForQuoteRsp.as_ref()) };
 }
 
 #[repr(C)]
@@ -505,10 +517,10 @@ static SPI_VTABLE: SpiVTable = SpiVTable{
 #[repr(C)]
 pub struct CThostFtdcMdSpi {
     vtable: *const SpiVTable,
-    pub md_spi_ptr: *mut MdSpi
+    pub md_spi_ptr: *mut dyn MdSpi
 }
 
-fn new_spi(md_spi: *mut MdSpi) -> CThostFtdcMdSpi {
+fn new_spi(md_spi: *mut dyn MdSpi) -> CThostFtdcMdSpi {
     CThostFtdcMdSpi{ vtable: &SPI_VTABLE, md_spi_ptr: md_spi }
 }
 
@@ -532,19 +544,5 @@ mod tests {
         println!("{:?}", md_api);
         drop(md_api);
         assert!(true);
-    }
-
-    #[test]
-    fn get_trading_day() {
-        let flow_path = CString::new("").unwrap();
-        let mut md_api = MdApi::new(flow_path, false, false);
-        let trading_day = md_api.get_trading_day();
-        assert_eq!(b"19700101".len(), trading_day.to_bytes().len());
-        let year = ::std::str::from_utf8(&trading_day.to_bytes()[0..4]).unwrap().parse::<i32>().unwrap();
-        assert!(year > 1970 && year < 2038, "year of trading day {} is not an integer in [1971, 2037]", year);
-        let month = ::std::str::from_utf8(&trading_day.to_bytes()[4..6]).unwrap().parse::<i32>().unwrap();
-        assert!(month > 0 && month < 13, "month of trading day {} is not an integer in [1, 12]", month);
-        let day = ::std::str::from_utf8(&trading_day.to_bytes()[6..8]).unwrap().parse::<i32>().unwrap();
-        assert!(day > 0 && day < 32, "day of trading day {} is not an integer in [1, 31]", day);
     }
 }
